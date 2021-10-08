@@ -2,7 +2,7 @@
 
 SAPiC/Tamarin models for the work *Root-of-Trust Abstractions for Symbolic Analysis: Application to Attestation Protocols.* In International Workshop on Security and Trust Management (STM). Co-located with ESORICS 2021, October 6-8, 2021, Darmstadt, Germany.
 
-Authors:
+**Authors:**
 - Georgios Fotiadis
 - José Moreira
 - Thanassis Giannetsos
@@ -10,6 +10,14 @@ Authors:
 - Peter B. Rønne
 - Mark D. Ryan
 - Peter Y.A. Ryan
+
+**File summary:**
+ - AK_model.sapic: Model for the AK certification process.
+ - TLS_model.sapic: Model for the TLS certification process.
+ - Quote_model.sapic: Model for the TLS connection and attestation process.
+ - output/AK_model_analyzed.spthy: Tamarin output for the AK certification process.
+ - output/TLS_model_analyzed.spthy: Tamarin output for the TLS certification process.
+ - output/Quote_model_analyzed.spthy: Tamarin output for the TLS connection and attestation process.
 
 [![CC BY 4.0][cc-by-shield]][cc-by]
 
