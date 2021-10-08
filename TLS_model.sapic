@@ -1,0 +1,290 @@
+theory DeviceManagement_TLS_model
+begin
+
+builtins:
+        asymmetric-encryption,
+        signing
+
+functions:
+        nil/0,
+        makeCredential/3,
+        activateCredential/3 [private],
+        verifyCredential/3 [private],
+        swstate/0
+
+equations:
+        activateCredential(n, k, makeCredential(pk(k), m, n)) = m,
+        verifyCredential(n, k, makeCredential(pk(k), m, n)) = true
+
+
+//TPM Process
+let TPM =
+        insert <'authPolicy',  ~ak_h>, nil;
+        insert <'privatePart', ~ak_h>, ~ak_sk;
+        insert <'publicPart',  ~ak_h>, ak_pk;
+        insert 'PCR', nil;
+
+        !(
+                //TPM2_PCR_Extend
+                (
+                        let pat_tpm_command = <'TPM2_PCR_Extend', value> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);        
+
+                        lock 'device';
+                        lookup 'PCR' as pcr in
+                        insert 'PCR', <value, pcr>;
+                        unlock 'device'
+                ) ||
+                //TPM2_PolicyPCR
+                (
+                        let pat_tpm_command = <'TPM2_PolicyPCR', s_h> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command); 
+                   
+                        lock 'device';
+                        lookup 'PCR' as pcrL in
+                        lookup <'policyDigest', s_h> as pL in
+                        event PolicyPCR(s_h, pL);
+                        insert <'policyDigest', s_h>, <pcrL, 'TPM_CC_PolicyPCR', pL>; 
+                        unlock 'device'
+                ) ||        
+                //TPM2_Create
+                (
+                        let pat_tpm_command = <'TPM2_Create', authPolicy> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+                        new ~k_h;
+                        new ~k_sk;
+                        event SecretKey('TLS', ~k_sk);
+                        lock 'device';
+                        let k_pk = pk(~k_sk) in
+                        insert <'authPolicy',  ~k_h>, authPolicy;
+                        insert <'privatePart', ~k_h>, ~k_sk;
+                        insert <'publicPart',  ~k_h>, k_pk;
+                        []--[]-> [Tpm2CreateOut(<~k_h, k_pk>)];
+                        unlock 'device';
+                        0
+                ) ||
+                //TPM2_StartAuthSession
+                (
+                        let pat_tpm_command = <'TPM2_StartAuthSession'> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+                        new ~s_h;
+                        lock 'device';
+                        insert <'policyDigest', ~s_h>, nil;
+                        event CreateHandle(~s_h);
+                        out(~s_h);
+                        unlock 'device';
+                        0
+                ) ||
+                //TPM2_Certify
+                (
+                        let pat_tpm_command = <'TPM2_Certify', obj_sh, obj_h, a_h> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+                        lock 'device';
+                    
+                        lookup <'policyDigest', obj_sh> as obj_pd in
+                        lookup <'authPolicy', obj_h> as obj_ap in
+
+                        if obj_pd = obj_ap then
+                                lookup <'publicPart', obj_h> as obj_pk in
+                                lookup <'privatePart', a_h> as a_sk in
+                                out(sign(<obj_pk, obj_ap>, a_sk));
+                                unlock 'device'
+                        else 
+                                unlock 'device'
+                ) ||
+                //TPM2_Sign
+                (
+                        let pat_tpm_command = <'TPM2_Sign', k_sh, k_h, m> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+                        lock 'device';
+
+                        lookup <'policyDigest', k_sh> as k_pd in
+                        lookup <'authPolicy', k_h> as k_ap in
+
+                        if k_pd = k_ap then
+                                lookup <'privatePart', k_h> as k_sk in
+                                []--[]-> [Tpm2SignOut(sign(m, k_sk))];
+                                unlock 'device'
+                        else
+                                unlock 'device'
+                )
+        )
+        
+
+//Router Process
+let Router =
+        (
+                new ~tid;
+                
+                let pat_tpm_command0 = <'TPM2_PCR_Extend', swstate> in
+                event TPM_SendCommand(pat_tpm_command0);
+                out(pat_tpm_command0);
+
+                let tls_authPolicy = <<swstate, nil>, 'TPM_CC_PolicyPCR',  nil> in
+                let pat_tpm_command1 = <'TPM2_Create', tls_authPolicy> in
+                event TPM_SendCommand(pat_tpm_command1);
+                out(pat_tpm_command1);
+
+                [Tpm2CreateOut(<tls_h, tls_spk>)]--[]-> [];
+
+                event HasKey('TLS', ~RouterID, tls_spk);
+                
+                let pat_tpm_command2 = <'TPM2_StartAuthSession'> in
+                event TPM_SendCommand(pat_tpm_command2);
+                out(pat_tpm_command2);
+                in(tls_sh);
+
+                event GenerateTLS(~tid, tls_spk);
+
+                let pat_tpm_command3 = <'TPM2_PolicyPCR', tls_sh> in
+                event TPM_SendCommand(pat_tpm_command3);
+                out(pat_tpm_command3);
+
+                let pat_tpm_command4 = <'TPM2_Certify', tls_sh, tls_h, ~ak_h> in
+                event TPM_SendCommand(pat_tpm_command4);
+                out(pat_tpm_command4);
+                in(skae);
+
+                event RouterUseTLS(tls_spk);
+
+                event HasKey('AK', ~RouterID, ak_pk);
+
+                if verify(skae, <tls_spk, tls_authPolicy>, ak_pk) = true then			
+                        let pat_tpm_command5 = <'TPM2_Sign', tls_sh, tls_h, <tls_spk, skae>> in
+                        event TPM_SendCommand(pat_tpm_command5);
+                        out(pat_tpm_command5);
+                        [Tpm2SignOut(csr)]--[]-> [];
+
+                        event GenerateValue('CSR', ~RouterID, csr);
+                        event RouterRunning(~RouterID, ~ServerID, <tls_spk, swstate, ak_pk>);		
+                        out(<<tls_spk, skae>, csr>);
+
+                        event HasKey('NMS', ~RouterID, spk_nms);
+
+                        in(<tls_spk, signature_cert_tls>);
+                        if verify(signature_cert_tls, tls_spk, spk_nms) = true then
+                                event RouterCommit(~RouterID, ~ServerID, <tls_spk, signature_cert_tls>);
+                                event RouterFinish();
+                                0
+        )
+
+
+//RA/NMS Server Process
+let RANMSServer = 
+        !(
+                let tls_authPolicy = <<swstate, nil>, 'TPM_CC_PolicyPCR',  nil> in
+
+                in(<<tls_spk, skae>, csr>);
+
+                if verify(skae, <tls_spk, tls_authPolicy>, ak_pk) = true then
+                if verify(csr, <tls_spk, skae>, tls_spk) = true then		
+                        event ReceiveValue('CSR', ~ServerID, csr);
+                        event HasKey('TLS', ~ServerID, tls_spk);
+                        event HasKey('AK', ~ServerID, ak_pk);
+                        event HasKey('NMS', ~ServerID, spk_nms);
+
+                        event ServerCommit(~ServerID, ~RouterID, <tls_spk, swstate, ak_pk>);
+
+                        let pat_cert_tls = <tls_spk, sign(tls_spk, ~ssk_nms)> in
+                        event ServerRunning(~ServerID, ~RouterID, pat_cert_tls);
+                        out(pat_cert_tls);
+                        event ServerFinish();
+                        0 
+        )
+
+let main_process = ( TPM || Router || RANMSServer )
+
+//TPM objects
+new ~ak_sk;
+let ak_pk = pk(~ak_sk) in
+out(ak_pk);
+
+event SecretKey('AK', ~ak_sk);
+
+new ~ak_h;
+out(~ak_h);
+
+//Router objects
+new ~RouterID;
+out(~RouterID);
+
+//RA objects
+new ~ServerID;
+out(~ServerID);
+
+//NMS objects
+new ~ssk_nms;
+let spk_nms = pk(~ssk_nms) in
+out(spk_nms);
+
+event SecretKey('NMS', ~ssk_nms);
+
+
+//************************
+//Main process starts here
+//************************
+main_process
+
+
+
+restriction RestrictionTpmCommand:
+        "All c #t1. TPM_ReceiveCommand(c)@t1 ==>
+        ( (Ex #t2. TPM_SendCommand(c)@t2 & (t2 < t1))
+                & not(Ex #t3. TPM_ReceiveCommand(c)@t3 & not(#t3 = #t1))
+        )"
+
+lemma RouterFinishes:
+exists-trace
+        "Ex #t1. RouterFinish()@t1"
+
+lemma ServerFinishes:
+exists-trace
+        "Ex #t1. ServerFinish()@t1"
+
+lemma AvailabilityKey:
+        "All label id1 id2 k1 k2 #t1 #t2. not(id1 = id2) & HasKey(label, id1, k1)@t1 & HasKey(label, id2, k2)@t2 ==> (k1 = k2)"
+
+lemma FreshnessTLS:
+        "All tid1 tid2 k #t1 #t2. GenerateTLS(tid1, k)@t1 & GenerateTLS(tid2, k)@t2 ==> (tid1 = tid2)"
+
+lemma SecretKey:
+        "All label k #t1. SecretKey(label, k)@t1 ==> (not (Ex #t2. K(k)@t2))"	
+
+lemma CorrectTransfer:
+        "All label id1 m #t1. ReceiveValue(label, id1, m)@t1 ==> (Ex id2 #t2. GenerateValue(label, id2, m)@t2 & (t2 < t1))"
+
+//lemma NoReuse:
+//        "All k #t1 #t2. RouterUseTLS(k)@t1 & RouterUseTLS(k)@t2 ==>(#t1 = #t2)"
+
+lemma Authentication:
+        "(All X Y param #t1. RouterCommit(X, Y, param)@t1 ==>
+                ( Ex #t2. ServerRunning(Y, X, param)@t2 & (t2 < t1) )
+        ) &
+        (All X Y param #t1. ServerCommit(X, Y, param)@t1 ==>
+                ( Ex #t2. RouterRunning(Y, X, param)@t2 & (t2 < t1) )
+        )"
+
+end 
+
+/*
+==============================================================================
+summary of summaries:
+
+analyzed: TLS_model.sapic
+
+  RouterFinishes (exists-trace): verified (103 steps)
+  ServerFinishes (exists-trace): verified (92 steps)
+  AvailabilityKey (all-traces): verified (537 steps)
+  FreshnessTLS (all-traces): verified (4 steps)
+  SecretKey (all-traces): verified (10 steps)
+  CorrectTransfer (all-traces): verified (406 steps)
+  Authentication (all-traces): verified (2987 steps)
+
+==============================================================================
+*/

@@ -1,0 +1,261 @@
+theory DeviceManagement_Quote_model
+begin
+
+builtins:
+        symmetric-encryption,
+        asymmetric-encryption,
+        signing
+
+functions:
+        nil/0,
+        makeCredential/3,
+        activateCredential/3,	
+        verifyCredential/3,
+        swstate/0
+
+equations: 
+        activateCredential(n, k, makeCredential(pk(k), m, n)) = m,
+        verifyCredential(n, k, makeCredential(pk(k), m, n)) = true
+
+
+//TPM Process
+let TPM =
+        insert <'authPolicy',  ~ak_h>, nil;
+        insert <'privatePart', ~ak_h>, ~ak_sk;
+        insert <'publicPart',  ~ak_h>, ak_pk;
+
+        insert <'policyDigest',  ~ak_sh>, nil;
+        
+        insert <'authPolicy',  ~tls_h>, <<swstate, nil>, 'TPM_CC_PolicyPCR',  nil>;
+        insert <'privatePart', ~tls_h>, ~tls_sk;
+        insert <'publicPart',  ~tls_h>, tls_pk;
+        
+        //TPM2_Quote
+        !(
+                let pat_tpm_command = <'TPM2_Quote', k_h, k_sh, data> in		
+                [Tpm2QuoteIn(tid, pat_tpm_command)]--[]-> [];
+                event TPM_ReceiveCommand(pat_tpm_command);
+
+                lock 'device';
+                lookup 'PCR' as pcr in
+                lookup <'authPolicy', k_h> as aP in
+                lookup <'policyDigest', k_sh> as pD in		
+
+                if pD = aP then
+                        lookup <'privatePart', k_h> as k_privatePart in
+                        []--[]-> [Tpm2QuoteOut(tid, sign(<data, pcr>, k_privatePart))];
+                        unlock 'device'
+                else 
+                        unlock 'device'
+        )
+	
+	
+//Router Process
+let Router = 
+        (
+                (
+                        insert 'PCR', <'x', swstate, nil>;
+                        insert <'policyDigest',  ~tls_sh>, <<'x', swstate, nil>, 'TPM_CC_PolicyPCR',  nil>;
+                        
+                        event Corrupted();
+                    
+                        !(
+                                new ~tid;
+                                
+                                event HasKey('AK', ~RouterID, ak_pk);
+
+                                lookup 'session_key' as session_key in
+                                in(encrypted_qData);
+                                let qData = sdec(encrypted_qData, session_key) in
+                                event Receive(qData);
+                                
+                                let pat_tpm_command1 = <'TPM2_Quote', ~ak_h, ~ak_sh, qData> in
+                                event TPM_SendCommand(pat_tpm_command1);	
+                                []--[]-> [Tpm2QuoteIn(~tid, pat_tpm_command1)];
+                                [Tpm2QuoteOut(~tid, quote)]--[]-> [];
+
+                                event GenerateValue('QUOTE', ~RouterID, quote);
+                            
+                                let encrypted_quote = senc(quote, session_key) in
+                                event RouterRunning(~RouterID, ~ServerID, qData);  //FIXME !!!!!! SHOULD ADD session_key as well !!!!!!!!!!!!!!!!!!!!!!
+                                out(encrypted_quote);
+                                event RouterFinish1();
+                                0
+                        )
+                ) +	
+                (
+                        insert 'PCR', <swstate, nil>;
+                        insert <'policyDigest',  ~tls_sh>, <<swstate, nil>, 'TPM_CC_PolicyPCR',  nil>;
+                        
+                        event Trusted();
+
+                        !(
+                                new ~tid;
+
+                                event HasKey('AK', ~RouterID, ak_pk);
+
+                                lookup 'session_key' as session_key in	
+                                in(encrypted_qData);
+                    
+                                let qData = sdec(encrypted_qData, session_key) in
+                                event Receive(qData);			
+                    
+                                let pat_tpm_command1 = <'TPM2_Quote', ~ak_h, ~ak_sh, qData> in
+                                event TPM_SendCommand(pat_tpm_command1);	
+                                []--[]-> [Tpm2QuoteIn(~tid, pat_tpm_command1)];
+                                [Tpm2QuoteOut(~tid, quote)]--[]-> [];
+
+                                event GenerateValue('QUOTE', ~RouterID, quote);		
+
+                                let encrypted_quote = senc(quote, session_key) in
+                                event RouterRunning(~RouterID, ~ServerID, <qData, session_key>);
+                                out(encrypted_quote);
+                                event RouterFinish2();
+                                0
+                        )
+                )
+        )
+
+
+//RA/NMS Server Process
+let RANMSServer = 
+        !(
+                new ~tid;
+                new ~session_key;
+                new ~qData;
+                
+                event GenerateKey(~tid, ~session_key);
+                event GenerateQData(~tid, ~qData);
+                event Source(~qData);
+                event SecretKey('SessionKey', ~session_key);
+
+                insert 'session_key', ~session_key;
+
+                event HasKey('AK', ~ServerID, ak_pk);
+                    
+                let encrypted_qData = senc(~qData, ~session_key) in
+                event NMSUseKey(~session_key);
+                out(encrypted_qData);
+
+                in(encrypted_quote);
+                let quote = sdec(encrypted_quote, ~session_key) in
+
+                if verify(sdec(encrypted_quote, ~session_key), <~qData, <swstate, nil>>, ak_pk) = true then
+                        event ReceiveValue('QUOTE', ~ServerID, quote);
+                        event ServerCommit(~ServerID, ~RouterID, <~qData, ~session_key>);
+                        event ServerFinish();
+                        0
+        )
+
+let main_process = ( TPM || Router || RANMSServer)
+
+//TPM objects
+new ~ak_sk;
+let ak_pk = pk(~ak_sk) in
+out(ak_pk);
+
+event SecretKey('AK', ~ak_sk);
+
+new ~ak_h;
+out(~ak_h);
+
+new ~ak_sh;
+out(~ak_sh);
+
+new ~tls_sk;
+let tls_pk = pk(~tls_sk) in
+out(tls_pk);
+
+new ~tls_h;
+out(~tls_h);
+
+new ~tls_sh;
+out(~tls_sh);
+
+//Router objects
+new ~RouterID;
+out(~RouterID);
+
+//RA objects
+new ~ServerID;
+out(~ServerID);
+
+
+//************************
+//Main process starts here
+//************************
+main_process
+
+
+
+restriction RestrictionTpmCommand:
+        "All c #t1. TPM_ReceiveCommand(c)@t1 ==>
+        ( (Ex #t2. TPM_SendCommand(c)@t2 & (t2 < t1))
+                & not(Ex #t3. TPM_ReceiveCommand(c)@t3 & not(#t3 = #t1))
+        )"
+
+//lemma Debug:
+//exists-trace
+//	"Ex #t1 #t2 qData. Source(qData)@t2 & Receive(qData)@t1 & not(Ex #t3. K(qData)@t3)"
+
+lemma RouterFinishes1:
+exists-trace
+        "Ex #t1. RouterFinish1()@t1"
+
+lemma RouterFinishes2:
+exists-trace
+        "Ex #t1. RouterFinish2()@t1"        
+
+lemma ServerFinishes:
+exists-trace
+        "Ex #t1. ServerFinish()@t1"
+
+lemma AvailabilityKey:
+        "All label id1 id2 k1 k2 #t1 #t2. not(id1 = id2) & HasKey(label, id1, k1)@t1 & HasKey(label, id2, k2)@t2 ==> (k1 = k2)"
+
+lemma FreshnessQData:
+        "All tid1 tid2 k #t1 #t2. GenerateQData(tid1, k)@t1 & GenerateQData(tid2, k)@t2 ==> (tid1 = tid2)"
+
+lemma FreshnessKey:
+        "All tid1 tid2 k #t1 #t2. GenerateKey(tid1, k)@t1 & GenerateKey(tid2, k)@t2 ==> (tid1 = tid2)"
+
+lemma SecretKey:
+        "All label k #t1. SecretKey(label, k)@t1 ==> (not (Ex #t2. K(k)@t2))"
+
+lemma CorrectTransfer:
+        "All label id1 m #t1. ReceiveValue(label, id1, m)@t1 ==> (Ex id2 #t2. GenerateValue(label, id2, m)@t2 & (t2 < t1))"
+
+lemma Authentication:
+        "All X Y param #t1. ServerCommit(X, Y, param)@t1 ==>
+                ( ( Ex #t2. RouterRunning(Y, X, param)@t2 & (t2 < t1) )
+                & not(Ex X2 Y2 #t3. ServerCommit(X2, Y2, param)@t3 & not(#t3 = #t1))
+                )"
+
+lemma NoReuse:
+        "All k #t1 #t2. NMSUseKey(k)@t1 & NMSUseKey(k)@t2 ==>(#t1 = #t2)"
+
+lemma Corrupted:
+        "All #t1. Corrupted()@t1 ==> not(Ex X Y param #t2. ServerCommit(X, Y, param)@t2 & (#t1 < #t2))"
+
+end
+
+/*
+==============================================================================
+summary of summaries:
+
+analyzed: Quote_model.sapic
+
+  RouterFinishes1 (exists-trace): verified (18 steps)
+  RouterFinishes2 (exists-trace): verified (18 steps)
+  ServerFinishes (exists-trace): verified (18 steps)
+  AvailabilityKey (all-traces): verified (24 steps)
+  FreshnessQData (all-traces): verified (4 steps)
+  FreshnessKey (all-traces): verified (4 steps)
+  SecretKey (all-traces): verified (6 steps)
+  CorrectTransfer (all-traces): verified (9 steps)
+  Authentication (all-traces): verified (2237 steps)
+  NoReuse (all-traces): verified (8 steps)
+  Corrupted (all-traces): verified (1751 steps)
+
+==============================================================================
+*/

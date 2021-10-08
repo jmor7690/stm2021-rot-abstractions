@@ -1,0 +1,274 @@
+theory DeviceManagement_AK_model
+begin
+
+builtins:
+        asymmetric-encryption,
+        signing
+
+functions:
+        nil/0,
+        makeCredential/3,
+        activateCredential/3 [private],
+        verifyCredential/3 [private],
+        swstate/0
+
+equations:
+        activateCredential(n, k, makeCredential(pk(k), m, n)) = m,
+        verifyCredential(n, k, makeCredential(pk(k), m, n)) = true
+        
+
+//TPM Process        
+let TPM =
+        insert <'authPolicy',  ~ek_h>, nil;
+        insert <'privatePart', ~ek_h>, ~ek_sk;
+        insert <'publicPart',  ~ek_h>, ek_pk;
+        insert 'PCR', nil;
+
+        !(
+                //TPM2_Create
+                (
+                        let pat_tpm_command = <'TPM2_Create', authPolicy> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+                        new ~k_h;
+                        new ~k_sk;
+                        lock 'device';
+                        let k_pk = pk(~k_sk) in
+                        insert <'authPolicy',  ~k_h>, authPolicy;
+                        insert <'privatePart', ~k_h>, ~k_sk;
+                        event SecretKey('AK', ~k_sk);
+                        insert <'publicPart',  ~k_h>, k_pk;
+                        out(<~k_h, k_pk>);
+                        unlock 'device';
+                        0
+                ) ||
+                //TPM2_StartAuthSession
+                (
+                        let pat_tpm_command = <'TPM2_StartAuthSession'> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+                        new ~s_h;
+                        lock 'device';
+                        insert <'policyDigest', ~s_h>, nil;
+                        out(~s_h);
+                        unlock 'device';
+                        0
+                ) ||
+                //TPM2_ActivateCredential
+                (
+                        let pat_tpm_command = <'TPM2_ActivateCredential', a_h, a_sh, k_h, credentialBlob> in
+                        in(pat_tpm_command);
+                        event TPM_ReceiveCommand(pat_tpm_command);
+
+                        lock 'device';
+
+                        lookup <'policyDigest', a_sh> as a_sh_pd in
+                        lookup <'authPolicy', a_h> as a_ap in
+
+                        if a_ap = a_sh_pd then
+                                lookup <'publicPart', a_h> as a_pk in
+                                lookup <'privatePart', k_h> as k_sk in
+
+                                if verifyCredential(a_pk, k_sk, credentialBlob) = true then
+                                        let challenge = activateCredential(a_pk, k_sk, credentialBlob) in
+                                        event Receive(challenge);
+                                        []--[]-> [Tpm2ActivateOut(challenge)];
+                                        unlock 'device'
+                                else
+                                        unlock 'device'
+                        else
+                                unlock 'device'
+                ) 
+        )
+        
+
+//Router Process
+let Router =
+        (
+                new ~fqdn_router;
+                out(~fqdn_router);
+
+                new ~tid;
+                out(~tid);
+
+                let pat_cert_nms = <<spk_ra, fqdn_nms>, signature_cert_nms> in
+                in(pat_cert_nms);
+                if verify(signature_cert_nms, <spk_ra, fqdn_nms>, spk_nms) = true then
+                event HasKey('NMS', ~RouterID, spk_nms);
+		
+                let pat_tpm_command1 = <'TPM2_Create', nil> in
+                event TPM_SendCommand(pat_tpm_command1);
+                out(pat_tpm_command1);
+                in(<ak_h, ak_spk>);
+           
+                out(<'RA_enrollrequest', ~fqdn_router, ek_pk, ak_spk>);
+                in(<'RA_enrollrequest_resp', credentialBlob>);
+
+                let pat_tpm_command2 = <'TPM2_StartAuthSession'> in
+                event TPM_SendCommand(pat_tpm_command2);
+                out(pat_tpm_command2);
+                in(ak_sh);
+
+                event GenerateAK(~tid, ak_spk);
+                event HasKey('EK', ~RouterID, ek_pk);
+
+                let pat_tpm_command3 = <'TPM2_ActivateCredential', ak_h, ak_sh, ~ek_h, credentialBlob> in
+                event TPM_SendCommand(pat_tpm_command3);
+                out(pat_tpm_command3);
+                [Tpm2ActivateOut(challenge)]--[]-> [];
+
+                event RouterRunning(~RouterID, ~ServerID, challenge);
+
+                out(<'RA_enrollcert', challenge>);
+                        
+                let cert_ak = <<ak_spk, ~fqdn_router>, signature_cert_ak> in
+                in(<'RA_enrollcert_resp', cert_ak>);
+                
+                if verify(signature_cert_ak, <ak_spk, ~fqdn_router>, spk_ra) = true then
+                        event RouterCommit(~RouterID, ~ServerID, cert_ak);
+                        event RouterUseAK(~RouterID, ak_spk);
+                        event ReceiveCertAK(~RouterID, cert_ak);
+                        event HasKey('RA', ~RouterID, spk_ra);
+                        event HasKey('AK', ~RouterID, ak_spk);
+                        event RouterFinish();
+                        0
+        )
+
+
+//RA/NMS Server process
+let RANMSServer =
+        !(	
+                new ~fqdn_nms;
+                out(~fqdn_nms);
+                let cert_ra = <<spk_ra, ~fqdn_nms>, sign(<spk_ra, ~fqdn_nms>, ~ssk_nms)> in
+                out(cert_ra);
+
+                in(<'RA_enrollrequest', fqdn_router, ek_pk, ak_spk>);
+    
+                new ~challenge;
+                event Source(~challenge);
+                let credentialBlob = makeCredential(ek_pk, ~challenge, ak_spk) in
+                out(<'RA_enrollrequest_resp', credentialBlob>);
+
+                in(<'RA_enrollcert', ~challenge>);
+
+                let cert_ak = <<ak_spk, fqdn_router>, sign(<ak_spk, fqdn_router>, ~ssk_ra)> in
+
+                event GenerateCertAK(~ServerID, cert_ak);
+                event ServerRunning(~ServerID, ~RouterID, cert_ak);
+                event ServerCommit(~ServerID, ~RouterID, ~challenge);
+                out(<'RA_enrollcert_resp', cert_ak>);
+
+                event HasKey('AK', ~ServerID, ak_spk);
+                event HasKey('NMS', ~ServerID, spk_nms);
+                event HasKey('RA', ~ServerID, spk_ra);
+                event HasKey('EK', ~ServerID, ek_pk);
+                event ServerFinish();
+                0
+        )
+        
+let main_process = ( TPM || Router || RANMSServer )
+        
+//TPM objects
+new ~ek_sk;
+let ek_pk = pk(~ek_sk) in
+out(ek_pk);
+
+event SecretKey('EK', ~ek_sk);
+
+new ~ek_h;
+out(~ek_h);
+
+//Router objects
+new ~RouterID;
+out(~RouterID);
+
+//RA objects
+new ~ServerID;
+out(~ServerID);
+
+new ~ssk_ra;
+let spk_ra = pk(~ssk_ra) in
+out(spk_ra);
+
+event SecretKey('RAK', ~ssk_ra);
+
+//NMS objects
+new ~ssk_nms;
+let spk_nms = pk(~ssk_nms) in
+out(spk_nms);
+
+event SecretKey('NMS', ~ssk_nms);
+
+
+//************************
+//Main process starts here
+//************************
+main_process
+
+
+
+restriction RestrictionTpmCommand:
+        "All c #t1. TPM_ReceiveCommand(c)@t1 ==>
+        ( (Ex #t2. TPM_SendCommand(c)@t2 & (t2 < t1))
+                & not(Ex #t3. TPM_ReceiveCommand(c)@t3 & not(#t3 = #t1))
+        )"
+
+lemma SourcesLemma [sources]:
+        "All m #t1. Receive(m)@t1 ==>
+                ((Ex #t2. KU(m)@t2 & (t2 < t1)) | (Ex #t3. Source(m)@t3))"
+
+lemma RouterFinishes:
+exists-trace
+        "Ex #t1. RouterFinish()@t1"
+
+lemma ServerFinishes:
+exists-trace
+        "Ex #t1. ServerFinish()@t1"
+
+lemma AvailabilityKey: 
+        "All label id1 id2 k1 k2 #t1 #t2. not(id1 = id2) & HasKey(label, id1, k1)@t1 & HasKey(label, id2, k2)@t2 ==> (k1 = k2)"
+
+lemma FreshnessAK:
+        "All tid1 tid2 k #t1 #t2. GenerateAK(tid1, k)@t1 & GenerateAK(tid2, k)@t2 ==> (tid1 = tid2)"
+
+lemma SecretKey:
+        "All label k #t1. SecretKey(label, k)@t1 ==> (not (Ex #t2. K(k)@t2))"
+
+lemma CorrectTransfer:
+        "All id1 m #t1. ReceiveCertAK(id1, m)@t1 ==> (Ex id2 #t2. GenerateCertAK(id2, m)@t2 & (t2 < t1))"
+
+//lemma NoReuse:
+//        "All label k #t1 #t2. RouterUseAK(label, k)@t1 & RouterUseAK(label, k)@t2 ==> (#t1=#t2)"
+
+lemma Authentication:
+        "(All X Y param #t1. RouterCommit(X, Y, param)@t1 ==>
+                ( ( Ex #t2. ServerRunning(Y, X, param)@t2 & (t2 < t1) )
+                & not( Ex X2 Y2 #t3. RouterCommit(X2, Y2, param)@t3 & not(#t3 = #t1) )
+                )
+        ) &
+        (All X Y param #t1. ServerCommit(X, Y, param)@t1 ==>
+                ( ( Ex #t2. RouterRunning(Y, X, param)@t2 & (t2 < t1) )
+                & not(Ex X2 Y2 #t3. ServerCommit(X2, Y2, param)@t3 & not(#t3 = #t1))
+                )
+        )"
+
+end
+
+/*
+==============================================================================
+summary of summaries:
+
+analyzed: AK_model.sapic
+
+  SourcesLemma (all-traces): verified (70 steps)
+  RouterFinishes (exists-trace): verified (37 steps)
+  ServerFinishes (exists-trace): verified (29 steps)
+  AvailabilityKey (all-traces): verified (1378 steps)
+  FreshnessAK (all-traces): verified (4 steps)
+  SecretKey (all-traces): verified (12 steps)
+  CorrectTransfer (all-traces): verified (383 steps)
+  Authentication (all-traces): verified (403 steps)
+
+==============================================================================
+*/
